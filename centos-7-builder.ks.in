@@ -1,102 +1,191 @@
 install
 cmdline
 reboot
-keyboard us
+firstboot --disable
+
+auth --enableshadow --passalgo=sha512
+keyboard --vckeymap=us --xlayouts='us'
 lang en_US.UTF-8
-timezone UTC
-network --bootproto=dhcp --device=eth0 --onboot=on
-rootpw --iscrypted $6$t5nrfmzb2CiWcTA7$12PVlif6C2cS8pEFhVAlFqOewvj0UlCe0czyOEeVzIrpc7UEqu0kFITHgK9pL.xjxPURA4YCqmkagFa6E6IEt0
-firewall --disabled
 selinux --permissive
-services --enabled chronyd
-skipx
-bootloader --timeout=1 --append="xen_blkfront.sda_is_xvda=1 serial=tty0 console=ttyS0,115200n8 zswap.enabled=1"
-clearpart --all
+timezone UTC --utc
+
+network --bootproto=dhcp
+firewall --disabled
+
+services --disabled="kdump" --enabled="network,sshd,rsyslog,chronyd"
+
+ignoredisk --only-use=vda
 zerombr
-part / --size 1536 --grow --fstype xfs
+clearpart --all --initlabel
+part / --fstype="xfs" --ondisk=vda --grow
+bootloader --append="console=tty0 console=ttyS0,115200n8 zswap.enabled=1" --location=mbr --timeout=1 --boot-drive=vda
 
-url --url=@INSTALL_TREE@
-repo --name updates --baseurl=@UPDATES_MIRROR@
-repo --name epel --baseurl=@EPEL_MIRROR@
+url --url="@INSTALL_TREE@"
+repo --name "os" --baseurl="@INSTALL_TREE@"
+repo --name "updates" --baseurl="@UPDATES_MIRROR@"
+repo --name "epel" --baseurl="@EPEL_MIRROR@"
 
-user --name=jenkins --groups=mock --homedir /var/lib/jenkins
+rootpw --lock
 
-%packages --instLangs=en
-cloud-utils-growpart
-chrony
-createrepo
-git
-java-1.7.0-openjdk
-mock
-policycoreutils-python
-rpm-build
-xfsprogs
-yum-utils
--yum-plugin-fastestmirror
-
-epel-release
-cloud-init
+%addon com_redhat_kdump --disable
 %end
 
-%post --erroronfail --log=/root/kickstart-post.log
-set -x
+%packages --excludedocs
+# Core group, followed by exlusions from that group
+@core
+-*-firmware
+-biosdevname
+-dracut-config-rescue
+-firewalld
+-iprutils
+-kernel-tools
+-kexec-tools
+-man-db
+-microcode_ctl
+-NetworkManager-team
+-NetworkManager-tui
+-NetworkManager-wifi
+-plymouth
+-rdma
 
-# Configure ttys
-cat > /etc/init/ttyS0.conf <<EOF
-stop on runlevel[016]
-start on runlevel[345]
-respawn
-instance /dev/ttyS0
-exec /sbin/mingetty /dev/ttyS0
+chrony
+cloud-init
+createrepo
+createrepo_c
+dracut-config-generic
+git
+grub2
+java-headless
+kernel
+mock
+rpm-build
+rsync
+%end
+
+%post --erroronfail --log=/root/kickstart-post-log.txt
+set -ex
+
+sed -i "1i Eucalyptus Build System Worker @PACKAGE_VERSION@ ($(date '+%F %T'))" /etc/issue
+
+cat > /etc/motd << EOF
+Eucalyptus Build System Worker @PACKAGE_VERSION@ ($(date '+%F %T'))
+
+To run commands as root, use user-data scripting.  To enable sudo, add
+users to the "wheel" group.
 EOF
 
-# Configure cloud-init
-cat > /etc/cloud/cloud.cfg <<EOF
-#cloud-config
-debug:
-  verbose: true
-user: jenkins
-disable_root: 1
-ssh_pwauth:   0
-resize_rootfs: true
-resize_rootfs_tmp: /dev
-cc_ready_cmd: ['/bin/true']
-locale_configfile: /etc/sysconfig/i18n
+# When the jenkins user *is* added to the wheel group we want it to
+# be able to use sudo without a password.
+sed -i -e '/^%wheel\s*ALL=(ALL)\s*ALL/s/^/#/' \
+       -e '/^#\s*%wheel\s*ALL=(ALL)\s*NOPASSWD:\s*ALL/s/#\s*//' \
+       /etc/sudoers
+
+# kernel has Requires(pre): linux-firmware, which is big and
+# unneccessary in a VM.
+yum -Cy remove linux-firmware
+
+# Ensure the first network interface will show up as eth0
+ln -s /dev/null /etc/udev/rules.d/80-net-name-slot.rules
+
+# Configure services
+systemctl mask tmp.mount
+echo "virtual-guest" > /etc/tuned/active_profile
+semanage fcontext -a -t mock_var_lib_t '/var/lib/jenkins/mock(/.*)?'
+ln -s ../var/lib/jenkins /srv/jenkins  # for compatibility with v4
+rmdir /var/lib/mock
+mkdir -p /var/lib/jenkins/mock
+ln -s jenkins/mock /var/lib/mock
+
+cat > /etc/cloud/cloud.cfg << EOF
+users:
+ - default
+disable_root: true
+preserve_hostname: false
+
 mount_default_fields: [~, ~, 'auto', 'defaults,nofail', '0', '2']
 ssh_deletekeys:   0
 ssh_genkeytypes:  ~
-ssh_svcname:      sshd
 syslog_fix_perms: ~
+
 cloud_init_modules:
+ - migrator
+ - seed_random
  - bootcmd
+ - write_files
  - growpart
  - resizefs
- - set_hostname
- - rsyslog
- - ssh
-cloud_config_modules:
  - disk_setup
  - mounts
+ - set_hostname
+ - update_hostname
+ - update_etc_hosts
+ - rsyslog
+ - users-groups
+ - ssh
+
+cloud_config_modules:
  - locale
  - set-passwords
+ - yum-add-repo
  - timezone
+ - disable-ec2-metadata
  - runcmd
+
 cloud_final_modules:
+ - package-update-upgrade-install
+ - puppet
+ - chef
+ - salt-minion
+ - mcollective
+ - rightscale_userdata
+ - scripts-vendor
  - scripts-per-once
  - scripts-per-boot
  - scripts-per-instance
  - scripts-user
+ - ssh-authkey-fingerprints
  - keys-to-console
+ - phone-home
  - final-message
+ - power-state-change
+
+system_info:
+  default_user:
+    name: jenkins
+    gecos: Jenkins
+    homedir: /var/lib/jenkins
+    shell: /bin/sh
+    groups: [mock]
+    lock_passwd: true
+  distro: rhel
+  paths:
+    cloud_dir: /var/lib/cloud
+    templates_dir: /etc/cloud/templates
+  ssh_svcname: sshd
+
+# Need to pass -f with extra_opts because "overwrite: true" isn't
+# processed for raw devices
+fs_setup:
+ - device: ephemeral0
+   filesystem: xfs
+   overwrite: true
+   extra_opts: ["-f"]
+
+mounts:
+ - ["ephemeral0", "/var/lib/jenkins", "xfs", ~, "1", "2"]
+
+runcmd:
+ - chown jenkins.jenkins /var/lib/jenkins
+ - mkdir -p /var/lib/jenkins/mock
+ - chown root.mock /var/lib/jenkins/mock
+ - chmod 2775 /var/lib/jenkins/mock
+ - restorecon /var/lib/jenkins/mock
 EOF
 
-# Configure mock
-cat > /etc/mock/site-defaults.cfg <<EOF
-config_opts['basedir']      = '/srv/jenkins/mock/build'
-config_opts['cache_topdir'] = '/srv/jenkins/mock/cache'
-config_opts['use_host_resolv'] = False
-config_opts['macros']['%vendor'] = "Hewlett Packard Enterprise"
-EOF
+# Cleanup
+yum clean all
+rm -rf /var/lib/yum/repos
+touch /var/log/cron
+touch /var/log/boot.log
+/usr/sbin/fixfiles -R -a restore
 %end
-
-#vim: set syntax=kickstart:

@@ -6,7 +6,6 @@ distdir = @PACKAGE_TARNAME@-@PACKAGE_VERSION@
 prefix = @prefix@
 datarootdir = @datarootdir@
 datadir = @datadir@
-imagedir = @datadir@/eucalyptus/service-images
 
 define destroyvm
 virsh undefine $<; virsh destroy $<; true
